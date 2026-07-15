@@ -163,6 +163,12 @@ def generate(
         input_ids.shape[0], dtype=torch.bool, device=input_ids.device
     )
 
+    # Device the model/inputs live on. On spyre/cpu this is cpu; on the GPU
+    # pre-compilation path it is cuda. The kv-cache and the slot_mapping/
+    # block_table/current_tkv_mask index tensors below are built from Python
+    # lists/scalars and must be placed on this device to match the model inputs.
+    input_device = input_ids.device
+
     ### Multimodal related
     # is_multimodal = requires_embedding_inputs(model.config)
     text_config = _get_text_config(model.config)
@@ -220,8 +226,13 @@ def generate(
                         kvheads,
                         head_size,
                         dtype=torch.float8_e4m3fn,
+                        device=input_device,
                     ),
-                    torch.tensor([1.0] * input_ids.shape[0], dtype=torch.float32),
+                    torch.tensor(
+                        [1.0] * input_ids.shape[0],
+                        dtype=torch.float32,
+                        device=input_device,
+                    ),
                     already_scaled,
                 ),
                 ScaledTensor(
@@ -231,8 +242,13 @@ def generate(
                         kvheads,
                         head_size,
                         dtype=torch.float8_e4m3fn,
+                        device=input_device,
                     ),
-                    torch.tensor([1.0] * input_ids.shape[0], dtype=torch.float32),
+                    torch.tensor(
+                        [1.0] * input_ids.shape[0],
+                        dtype=torch.float32,
+                        device=input_device,
+                    ),
                     already_scaled,
                 ),
             )
@@ -242,10 +258,20 @@ def generate(
         kwargs["past_key_value_states"] = [
             (
                 torch.zeros(
-                    NUM_BLOCKS, BLOCK_SIZE, kvheads, head_size, dtype=model_dtype
+                    NUM_BLOCKS,
+                    BLOCK_SIZE,
+                    kvheads,
+                    head_size,
+                    dtype=model_dtype,
+                    device=input_device,
                 ),
                 torch.zeros(
-                    NUM_BLOCKS, BLOCK_SIZE, kvheads, head_size, dtype=model_dtype
+                    NUM_BLOCKS,
+                    BLOCK_SIZE,
+                    kvheads,
+                    head_size,
+                    dtype=model_dtype,
+                    device=input_device,
                 ),
             )
             for _ in range(text_config.nlayers)
@@ -326,7 +352,11 @@ def generate(
                 # we need to clone these tensors to ensure the pointer offset is 0
                 input_ids_seq = input_ids[seq_i][-current_tkv:].unsqueeze(0).clone()
                 slot_mapping_seq = (
-                    torch.tensor(slot_mapping[seq_i][-current_tkv:], dtype=torch.int64)
+                    torch.tensor(
+                        slot_mapping[seq_i][-current_tkv:],
+                        dtype=torch.int64,
+                        device=input_device,
+                    )
                     .unsqueeze(0)
                     .clone()
                 )
@@ -424,6 +454,7 @@ def generate(
                             torch.tensor(
                                 slot_mapping_seq_chunk,
                                 dtype=torch.int64,
+                                device=input_device,
                             )
                             .unsqueeze(0)
                             .clone()
@@ -446,7 +477,9 @@ def generate(
                         )
 
                         current_tkv_mask_seq_chunk = torch.tensor(
-                            (chunk_j + 1) * prefill_chunk_size, dtype=torch.int64
+                            (chunk_j + 1) * prefill_chunk_size,
+                            dtype=torch.int64,
+                            device=input_device,
                         ).unsqueeze(0)
 
                         block_end = chunk_end // BLOCK_SIZE
@@ -458,6 +491,7 @@ def generate(
                                 block_pad_len : block_pad_len + block_end
                             ],
                             dtype=torch.int64,
+                            device=input_device,
                         ).unsqueeze(0)
 
                         chunked_kwargs = {
@@ -575,11 +609,14 @@ def generate(
                     for b_seq in block_table
                 ],
                 dtype=torch.int64,
+                device=input_device,
             )
             kwargs["left_padded_prompt_mask"] = left_padded_prompt_mask
             current_tkv_mask = current_tkv_mask + 1
             kwargs["current_tkv_mask"] = current_tkv_mask
-            kwargs["slot_mapping"] = torch.tensor(slot_mapping, dtype=torch.int64)
+            kwargs["slot_mapping"] = torch.tensor(
+                slot_mapping, dtype=torch.int64, device=input_device
+            )
 
             # batch
             input_ids = input_ids.clone(memory_format=torch.contiguous_format)

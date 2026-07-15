@@ -297,6 +297,25 @@ def parse_cli_args() -> argparse.Namespace:
         help="set to true to save cpu validation outputs for later consumption",
     )
     parser.add_argument(
+        "--validation_device",
+        type=str,
+        default="cpu",
+        choices=["cpu", "cuda"],
+        help="device used to compute the reference (golden) validation info. "
+        "'cpu' is the default; 'cuda' runs the reference on GPU (used by the "
+        "GPU pre-compilation stage to generate validation info faster). The "
+        "reference is still computed at the cpu_dtype (fp32) either way.",
+    )
+    parser.add_argument(
+        "--generate_validation_only",
+        action="store_true",
+        help="only generate and save the reference validation info, then exit. "
+        "Skips loading/compiling the AIU (spyre) model, warmup, and AIU "
+        "inference/comparison. Used by the GPU pre-compilation stage to "
+        "populate the shared validation_info dir for a later AIU run to consume. "
+        "Implies --save_validation_info_outputs.",
+    )
+    parser.add_argument(
         "--prioritize_large_batch_sizes",
         action="store_true",
         help="set to true if you would like to prioritize large batch sizes",
@@ -705,7 +724,7 @@ def get_sampler(dataset_type: str, dataset_path: str, tokenizer: AutoTokenizer):
 
 
 def load_model(
-    device_type: Literal["cpu", "spyre"],
+    device_type: Literal["cpu", "spyre", "cuda"],
     is_fp8: bool,
     model_kwargs: Dict[str, Any],
     distributed_kwargs: Dict[str, Any],
@@ -723,6 +742,8 @@ def load_model(
     Args:
         device_type: Target device for model execution. Options:
             - "cpu": Load on CPU for validation (fp32, no compilation)
+            - "cuda": Load on GPU for validation (fp32, no compilation). Same
+              reference as "cpu", just computed on GPU for speed.
             - "spyre": Load on CPU, compile for Spyre/AIU execution (fp16, with sendnn compilation)
         is_fp8: If True, uses FP8 quantization (dtype=None for auto-detection).
         model_kwargs: Dictionary with model loading parameters (variant or path).
@@ -735,20 +756,26 @@ def load_model(
         with sendnn backend and may have FP8 weight conversion applied.
     """
 
-    if device_type not in ["cpu", "spyre"]:
+    if device_type not in ["cpu", "spyre", "cuda"]:
         raise ValueError(
-            f"device_type must be 'cpu' or 'spyre' for DPP, got '{device_type}'"
+            f"device_type must be 'cpu', 'cuda', or 'spyre' for DPP, got '{device_type}'"
         )
 
+    # Both validation devices (cpu/cuda) use the fp32 reference dtype; only the
+    # AIU (spyre) path runs fp16.
     dtype = (
-        (torch.float32 if device_type == "cpu" else torch.float16)
+        (torch.float16 if device_type == "spyre" else torch.float32)
         if not is_fp8
         else None
     )
 
+    # spyre loads on CPU then compiles for the accelerator; cuda loads directly
+    # on GPU; cpu loads on CPU.
+    get_model_device_type = "cuda" if device_type == "cuda" else "cpu"
+
     with stagger_region(stagger_load):
         model = get_model(
-            device_type="cpu",
+            device_type=get_model_device_type,
             data_type=dtype,
             fused_weights=False,
             **model_kwargs,
@@ -1028,6 +1055,18 @@ def generate_cpu_validation(
         sample_key=sample_key,
     )
     if cpu_validation_info is None:
+        # Move inputs onto the validation model's device so the reference can be
+        # computed on cpu or cuda. No-op for cpu; required for cuda. Non-tensor
+        # entries in extra_kwargs (e.g. attn_name) are left untouched. The paged
+        # generate path re-derives most tensors from input_ids.device, and
+        # extract_validation_information moves outputs back to cpu before saving,
+        # so the saved artifact is identical regardless of compute device.
+        ref_device = next(validation_model.parameters()).device
+        input_ids = input_ids.to(ref_device)
+        extra_kwargs = {
+            k: (v.to(ref_device) if isinstance(v, torch.Tensor) else v)
+            for k, v in extra_kwargs.items()
+        }
         cpu_validation_info = extract_validation_information(
             model=validation_model,
             input_ids=input_ids,
@@ -1347,17 +1386,24 @@ def generate_validation_info_and_test(
     profile: Optional[Any] = None,
     pad_token_id: Optional[int] = None,
     warmup_run: bool = False,
+    generate_validation_only: bool = False,
 ) -> list[Any]:
     """Generates tokens using AIU and CPU models and validates the results.
 
     This function iterates through prepared prompts, executes the generation
     cycle for both hardware targets, and evaluates whether the AIU outputs
     match the golden reference.
+
+    When ``generate_validation_only`` is set, only the reference (golden)
+    validation info is generated and saved for each prompt -- the AIU model,
+    warmup, AIU inference, and comparison are all skipped. This is the GPU
+    pre-compilation mode: it populates the shared validation_info dir so a later
+    AIU run loads the reference instead of computing it on CPU.
     """
 
     failed_cases = []
     valid_prompts = list(valid_prompts)
-    if warmup_run and valid_prompts:
+    if warmup_run and not generate_validation_only and valid_prompts:
         first = valid_prompts[0]
         first.extra_kwargs["attn_name"] = env_config.attn_name
         first.extra_kwargs["_kvcache_num_blocks_hint"] = model_config.num_blocks
@@ -1383,6 +1429,25 @@ def generate_validation_info_and_test(
             dprint(
                 f"program id: {valid_prompt.program_id}, valid prompt: {valid_prompt.shape}, input shape: {valid_prompt.input_ids.shape}"
             )
+
+        # GPU pre-compilation: generate + save the reference only, then move on.
+        if generate_validation_only:
+            generate_cpu_validation(
+                model_variant=model_variant,
+                max_new_tokens=max_new_tokens,
+                validation_info_outputs_dir=validation_info_outputs_dir,
+                save_validation_info_outputs=save_validation_info_outputs,
+                validation_model=validation_model,
+                valid_prompt=valid_prompt.shape,
+                input_ids=valid_prompt.input_ids,
+                extra_kwargs=valid_prompt.extra_kwargs,
+                sample_key=valid_prompt.sample_key,
+                attn_name=env_config.attn_name,
+                cpu_dtype=env_config.cpu_dtype,
+                tokenizer=tokenizer,
+                pad_token_id=pad_token_id,
+            )
+            continue
 
         # Start inference
         if not skip_validation:
@@ -1566,6 +1631,9 @@ def main() -> None:
     distributed_kwargs: Dict[str, Any] = _get_distributed_kwargs(
         is_distributed=args.distributed, dist_timeout=args.dist_timeout
     )
+    # In GPU pre-compilation mode, saving the reference is the whole point.
+    if args.generate_validation_only:
+        args.save_validation_info_outputs = True
     args.save_validation_info_outputs = args.save_validation_info_outputs and (
         dist.get_rank() == 0
     )
@@ -1579,18 +1647,22 @@ def main() -> None:
         world_size=world_size,
         prefill_chunk_size=args.prefill_chunk_size,
     )
-    model = load_model(
-        device_type="spyre",
-        is_fp8=is_fp8,
-        model_kwargs=model_kwargs,
-        distributed_kwargs=distributed_kwargs,
-        stagger_load=args.stagger_load,
-        model_config=model_config,
-    )
+    # Skip the AIU (spyre) model in reference-only mode -- the GPU pod has no AIU
+    # device. Otherwise load and compile it as usual.
+    model = None
+    if not args.generate_validation_only:
+        model = load_model(
+            device_type="spyre",
+            is_fp8=is_fp8,
+            model_kwargs=model_kwargs,
+            distributed_kwargs=distributed_kwargs,
+            stagger_load=args.stagger_load,
+            model_config=model_config,
+        )
     validation_model = None
-    if not args.skip_validation:
+    if args.generate_validation_only or not args.skip_validation:
         validation_model = load_model(
-            device_type="cpu",
+            device_type=args.validation_device,
             is_fp8=is_fp8,
             model_kwargs=model_kwargs,
             distributed_kwargs=distributed_kwargs,
@@ -1604,41 +1676,48 @@ def main() -> None:
     # AIU (fp16) model so they match (modulo the fp16 cast), isolating AIU numeric
     # divergence as the only difference. Done before warmup; .compile() only wraps
     # forward, so load_state_dict on the same params is safe.
-    if args.load_format == "dummy" and validation_model is not None:
+    if (
+        args.load_format == "dummy"
+        and validation_model is not None
+        and model is not None
+    ):
         model.load_state_dict(
             {k: v.to(torch.float16) for k, v in validation_model.state_dict().items()}
         )
 
     # Model Warmup
-    ## warmup with any input so compiler produces criteria json
-    ## TODO: Swap this with _prepare_inputs once fix for shape_id is available
-    ## input_ids, extra_kwargs, sample_key = _prepare_inputs(2, max_tkv, tokenizer)
-    prompt_list = [torch.arange(0, PAD_MULTIPLE, dtype=torch.int64)]
-    # matching vllm warmup to pad to 2 on fp8, and no pad for fp16
-    if is_fp8:
-        prompt_list = prompt_list * 2
-    input_ids, extra_kwargs = pad_input_ids(
-        prompt_list, min_pad_length=64, pad_token_id=pad_token_id
-    )
-    extra_kwargs["mask"] = extra_kwargs["mask"].to(torch.float16)
-    extra_kwargs["attn_name"] = env_config.attn_name
-    extra_kwargs["_kvcache_num_blocks_hint"] = model_config.num_blocks
-    warmup_model(
-        model=model,
-        input_ids=input_ids,
-        max_new_tokens=args.max_new_tokens,
-        compile_dynamic_sendnn=True,
-        stagger_update_lazyhandle=args.stagger_update_lazyhandle,
-        prefill_chunk_size=args.prefill_chunk_size,
-        print_utilization=args.report_resource_utilization,
-        profile=p,
-        pad_token_id=pad_token_id,
-        **extra_kwargs,
-    )
-    if args.distributed:
-        # wait for rank0 to be finished as it is the only one generating the criteria json
-        # this is needed since otherwise we may run into a race condition
-        torch.distributed.barrier()
+    # Skipped in reference-only mode: warmup exists to compile the AIU model and
+    # produce the criteria json, neither of which applies on the GPU pod.
+    if not args.generate_validation_only:
+        ## warmup with any input so compiler produces criteria json
+        ## TODO: Swap this with _prepare_inputs once fix for shape_id is available
+        ## input_ids, extra_kwargs, sample_key = _prepare_inputs(2, max_tkv, tokenizer)
+        prompt_list = [torch.arange(0, PAD_MULTIPLE, dtype=torch.int64)]
+        # matching vllm warmup to pad to 2 on fp8, and no pad for fp16
+        if is_fp8:
+            prompt_list = prompt_list * 2
+        input_ids, extra_kwargs = pad_input_ids(
+            prompt_list, min_pad_length=64, pad_token_id=pad_token_id
+        )
+        extra_kwargs["mask"] = extra_kwargs["mask"].to(torch.float16)
+        extra_kwargs["attn_name"] = env_config.attn_name
+        extra_kwargs["_kvcache_num_blocks_hint"] = model_config.num_blocks
+        warmup_model(
+            model=model,
+            input_ids=input_ids,
+            max_new_tokens=args.max_new_tokens,
+            compile_dynamic_sendnn=True,
+            stagger_update_lazyhandle=args.stagger_update_lazyhandle,
+            prefill_chunk_size=args.prefill_chunk_size,
+            print_utilization=args.report_resource_utilization,
+            profile=p,
+            pad_token_id=pad_token_id,
+            **extra_kwargs,
+        )
+        if args.distributed:
+            # wait for rank0 to be finished as it is the only one generating the criteria json
+            # this is needed since otherwise we may run into a race condition
+            torch.distributed.barrier()
 
     # Prompt Preparation
     valid_prompts = prepare_test_prompts(
@@ -1680,9 +1759,16 @@ def main() -> None:
         profile=p,
         pad_token_id=pad_token_id,
         warmup_run=args.warmup_run,
+        generate_validation_only=args.generate_validation_only,
     )
 
-    if not args.skip_validation and local_rank == 0:
+    if args.generate_validation_only:
+        if local_rank == 0:
+            dprint(
+                "reference validation info generated and saved to "
+                f"{args.validation_info_outputs_dir}"
+            )
+    elif not args.skip_validation and local_rank == 0:
         if len(failed_cases) != 0:
             dprint("The test failed with the following cases:")
             for failed_case in failed_cases:
